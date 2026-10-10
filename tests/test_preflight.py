@@ -17,8 +17,10 @@ from power_tide.preflight import (
     WEATHER_VARIABLES,
     audit_local_eia_json_files,
     check_eia_api_coverage,
+    compute_expected_eia_hourly_sequence,
     compute_expected_weather_target_timestamps,
     generate_evaluation_date_range,
+    get_configured_eia_api_key,
     query_ecmwf_ifs_run_audit,
 )
 
@@ -50,6 +52,28 @@ def _make_valid_locations_payload(run_date: date) -> list[dict]:
             }
         )
     return locations
+
+
+def _make_mock_eia_payload(
+    count: int = 2208,
+    start_period: str = HOLDOUT_TARGET_START,
+    end_period: str = HOLDOUT_TARGET_END,
+    respondent: str = "ERCO",
+    series_type: str = "D",
+    value: float = 45000.0,
+) -> dict:
+    """Helper to construct a valid EIA API v2 holdout response payload."""
+    periods = compute_expected_eia_hourly_sequence(start_period, end_period)[:count]
+    rows = [
+        {"period": p, "respondent": respondent, "type": series_type, "value": value}
+        for p in periods
+    ]
+    return {
+        "response": {
+            "total": str(len(rows)),
+            "data": rows,
+        }
+    }
 
 
 def test_generate_evaluation_date_range() -> None:
@@ -124,6 +148,98 @@ def test_audit_local_eia_gap_detection_synthetic(tmp_path: Path) -> None:
     assert "2024-01-01T01" in summary.missing_period_samples
 
 
+def test_audit_local_eia_missing_period_field(tmp_path: Path) -> None:
+    f = tmp_path / "missing_period.json"
+    data = {
+        "response": {
+            "data": [
+                {"respondent": "ERCO", "type": "D", "value": 35000},
+                {"period": "2024-01-01T01", "respondent": "ERCO", "type": "D", "value": 34000},
+            ]
+        }
+    }
+    f.write_text(json.dumps(data), encoding="utf-8")
+    summary = audit_local_eia_json_files([f])
+    assert summary.status == "FAIL"
+    assert any("missing a valid 'period' field" in err for err in summary.errors)
+
+
+def test_audit_local_eia_null_value(tmp_path: Path) -> None:
+    f = tmp_path / "null_value.json"
+    data = {
+        "response": {
+            "data": [
+                {"period": "2024-01-01T00", "respondent": "ERCO", "type": "D", "value": None},
+                {"period": "2024-01-01T01", "respondent": "ERCO", "type": "D", "value": 34000},
+            ]
+        }
+    }
+    f.write_text(json.dumps(data), encoding="utf-8")
+    summary = audit_local_eia_json_files([f])
+    assert summary.status == "FAIL"
+    assert summary.null_value_count == 1
+    assert any("null demand values" in err for err in summary.errors)
+
+
+def test_audit_local_eia_duplicate_periods_different_values(tmp_path: Path) -> None:
+    f = tmp_path / "dup_diff_val.json"
+    data = {
+        "response": {
+            "data": [
+                {"period": "2024-01-01T00", "respondent": "ERCO", "type": "D", "value": 35000},
+                {"period": "2024-01-01T00", "respondent": "ERCO", "type": "D", "value": 42000},
+                {"period": "2024-01-01T01", "respondent": "ERCO", "type": "D", "value": 34000},
+            ]
+        }
+    }
+    f.write_text(json.dumps(data), encoding="utf-8")
+    summary = audit_local_eia_json_files([f])
+    assert summary.status == "FAIL"
+    assert summary.duplicate_periods_count == 1
+    assert any("duplicate hourly period timestamps" in err for err in summary.errors)
+
+
+def test_audit_local_eia_invalid_numeric_values(tmp_path: Path) -> None:
+    f = tmp_path / "invalid_vals.json"
+    data = {
+        "response": {
+            "data": [
+                {"period": "2024-01-01T00", "respondent": "ERCO", "type": "D", "value": -50.0},
+                {
+                    "period": "2024-01-01T01",
+                    "respondent": "ERCO",
+                    "type": "D",
+                    "value": "not-a-number",
+                },
+                {"period": "2024-01-01T02", "respondent": "ERCO", "type": "D", "value": 34000},
+            ]
+        }
+    }
+    f.write_text(json.dumps(data), encoding="utf-8")
+    summary = audit_local_eia_json_files([f])
+    assert summary.status == "FAIL"
+    assert summary.invalid_value_count == 2
+    assert any("invalid or negative numeric values" in err for err in summary.errors)
+
+
+def test_audit_local_eia_unsorted_records(tmp_path: Path) -> None:
+    f = tmp_path / "unsorted.json"
+    data = {
+        "response": {
+            "data": [
+                {"period": "2024-01-01T02", "respondent": "ERCO", "type": "D", "value": 33000},
+                {"period": "2024-01-01T01", "respondent": "ERCO", "type": "D", "value": 34000},
+                {"period": "2024-01-01T00", "respondent": "ERCO", "type": "D", "value": 35000},
+            ]
+        }
+    }
+    f.write_text(json.dumps(data), encoding="utf-8")
+    summary = audit_local_eia_json_files([f])
+    assert summary.status == "FAIL"
+    assert summary.is_chronological is False
+    assert any("not in strictly ascending chronological order" in err for err in summary.errors)
+
+
 def test_audit_local_eia_duplicate_and_type_mismatch(tmp_path: Path) -> None:
     f1 = tmp_path / "bad.json"
     data = {
@@ -163,7 +279,6 @@ def test_query_ecmwf_ifs_run_audit_success() -> None:
 def test_query_ecmwf_ifs_run_audit_missing_variable() -> None:
     d = date(2026, 7, 1)
     payload = _make_valid_locations_payload(d)
-    # Delete wind_speed_10m from Dallas
     del payload[0]["hourly"]["wind_speed_10m"]
 
     mock_resp = MagicMock()
@@ -180,7 +295,6 @@ def test_query_ecmwf_ifs_run_audit_missing_variable() -> None:
 def test_query_ecmwf_ifs_run_audit_short_array() -> None:
     d = date(2026, 7, 1)
     payload = _make_valid_locations_payload(d)
-    # Truncate time array to 20 hours
     payload[1]["hourly"]["time"] = payload[1]["hourly"]["time"][:20]
 
     mock_resp = MagicMock()
@@ -197,7 +311,6 @@ def test_query_ecmwf_ifs_run_audit_short_array() -> None:
 def test_query_ecmwf_ifs_run_audit_incorrect_timestamps() -> None:
     d = date(2026, 7, 1)
     payload = _make_valid_locations_payload(d)
-    # Tamper with index 25 timestamp in Houston
     payload[1]["hourly"]["time"][25] = "2026-07-02T05:00"
 
     mock_resp = MagicMock()
@@ -214,7 +327,6 @@ def test_query_ecmwf_ifs_run_audit_incorrect_timestamps() -> None:
 def test_query_ecmwf_ifs_run_audit_null_target_values() -> None:
     d = date(2026, 7, 1)
     payload = _make_valid_locations_payload(d)
-    # Insert null in target slice of temperature_2m in Austin
     payload[2]["hourly"]["temperature_2m"][30] = None
 
     mock_resp = MagicMock()
@@ -227,6 +339,37 @@ def test_query_ecmwf_ifs_run_audit_null_target_values() -> None:
     assert res.available is False
     assert res.target_window_nulls == 1
     assert any("temperature_2m' has 1 nulls in target window" in r for r in res.failure_reasons)
+
+
+def test_query_ecmwf_ifs_run_audit_malformed_json_bytes() -> None:
+    d = date(2026, 7, 1)
+    mock_resp = MagicMock()
+    mock_resp.read.return_value = b"{not-valid-json-syntax"
+    mock_resp.__enter__.return_value = mock_resp
+
+    with patch("urllib.request.urlopen", return_value=mock_resp):
+        res = query_ecmwf_ifs_run_audit(d)
+
+    assert res.available is False
+    assert any("Malformed JSON response" in r for r in res.failure_reasons)
+
+
+def test_query_ecmwf_ifs_run_audit_incorrect_location_coordinates() -> None:
+    d = date(2026, 7, 1)
+    payload = _make_valid_locations_payload(d)
+    # Move Dallas coordinates well outside 0.20 deg tolerance
+    payload[0]["latitude"] = 35.0
+    payload[0]["longitude"] = -90.0
+
+    mock_resp = MagicMock()
+    mock_resp.read.return_value = json.dumps(payload).encode("utf-8")
+    mock_resp.__enter__.return_value = mock_resp
+
+    with patch("urllib.request.urlopen", return_value=mock_resp):
+        res = query_ecmwf_ifs_run_audit(d)
+
+    assert res.available is False
+    assert any("exceed snapping tolerance" in r for r in res.failure_reasons)
 
 
 def test_query_ecmwf_ifs_run_audit_malformed_response() -> None:
@@ -253,32 +396,107 @@ def test_query_ecmwf_ifs_run_audit_timeout() -> None:
     assert any("timed out" in r for r in res.failure_reasons)
 
 
-def test_check_eia_api_coverage_missing_key() -> None:
+def test_get_configured_eia_api_key_from_env_file(tmp_path: Path) -> None:
+    env_file = tmp_path / ".env"
+    env_file.write_text("# Test Comment\nEIA_API_KEY=test_file_key_abc123\n", encoding="utf-8")
     with patch.dict("os.environ", {}, clear=True):
-        res = check_eia_api_coverage()
+        key = get_configured_eia_api_key(workspace_dir=tmp_path)
+        assert key == "test_file_key_abc123"
+
+
+def test_check_eia_api_coverage_missing_key(tmp_path: Path) -> None:
+    with patch.dict("os.environ", {}, clear=True):
+        res = check_eia_api_coverage(workspace_dir=tmp_path)
         assert res.api_key_configured is False
         assert res.status == "BLOCKED"
         assert "EIA_API_KEY environment variable is not configured" in res.message
 
 
-def test_check_eia_api_coverage_success_mocked() -> None:
+def test_check_eia_api_coverage_success_mocked(tmp_path: Path) -> None:
     mock_resp = MagicMock()
-    mock_resp.read.return_value = json.dumps({"response": {"total": 2208}}).encode("utf-8")
+    payload = _make_mock_eia_payload(2208)
+    mock_resp.read.return_value = json.dumps(payload).encode("utf-8")
     mock_resp.__enter__.return_value = mock_resp
 
     with patch.dict("os.environ", {"EIA_API_KEY": "test_key_abc"}):
         with patch("urllib.request.urlopen", return_value=mock_resp):
-            res = check_eia_api_coverage()
+            res = check_eia_api_coverage(workspace_dir=tmp_path)
             assert res.api_key_configured is True
             assert res.status == "GO"
             assert res.total_reported == 2208
+            assert res.rows_returned == 2208
+            assert res.timestamps_valid is True
+            assert res.data_integrity_valid is True
+            assert len(res.validation_errors) == 0
 
 
-def test_check_eia_api_coverage_http_error_mocked() -> None:
+def test_check_eia_api_coverage_row_count_mismatch(tmp_path: Path) -> None:
+    mock_resp = MagicMock()
+    payload = _make_mock_eia_payload(2208)
+    payload["response"]["data"] = payload["response"]["data"][:100]  # only 100 rows returned
+    mock_resp.read.return_value = json.dumps(payload).encode("utf-8")
+    mock_resp.__enter__.return_value = mock_resp
+
+    with patch.dict("os.environ", {"EIA_API_KEY": "test_key_abc"}):
+        with patch("urllib.request.urlopen", return_value=mock_resp):
+            res = check_eia_api_coverage(workspace_dir=tmp_path)
+            assert res.status == "ERROR"
+            assert res.rows_returned == 100
+            assert any("does not match" in err for err in res.validation_errors)
+
+
+def test_check_eia_api_coverage_duplicate_timestamps(tmp_path: Path) -> None:
+    mock_resp = MagicMock()
+    payload = _make_mock_eia_payload(2208)
+    # Inject a duplicate timestamp
+    payload["response"]["data"][1]["period"] = payload["response"]["data"][0]["period"]
+    mock_resp.read.return_value = json.dumps(payload).encode("utf-8")
+    mock_resp.__enter__.return_value = mock_resp
+
+    with patch.dict("os.environ", {"EIA_API_KEY": "test_key_abc"}):
+        with patch("urllib.request.urlopen", return_value=mock_resp):
+            res = check_eia_api_coverage(workspace_dir=tmp_path)
+            assert res.status == "ERROR"
+            assert res.duplicate_timestamps_count > 0
+            assert any("duplicate timestamps" in err for err in res.validation_errors)
+
+
+def test_check_eia_api_coverage_null_demand_value(tmp_path: Path) -> None:
+    mock_resp = MagicMock()
+    payload = _make_mock_eia_payload(2208)
+    payload["response"]["data"][5]["value"] = None
+    mock_resp.read.return_value = json.dumps(payload).encode("utf-8")
+    mock_resp.__enter__.return_value = mock_resp
+
+    with patch.dict("os.environ", {"EIA_API_KEY": "test_key_abc"}):
+        with patch("urllib.request.urlopen", return_value=mock_resp):
+            res = check_eia_api_coverage(workspace_dir=tmp_path)
+            assert res.status == "ERROR"
+            assert res.null_values_count == 1
+            assert any("null demand values" in err for err in res.validation_errors)
+
+
+def test_check_eia_api_coverage_invalid_respondent_and_type(tmp_path: Path) -> None:
+    mock_resp = MagicMock()
+    payload = _make_mock_eia_payload(2208)
+    payload["response"]["data"][0]["respondent"] = "MISO"
+    payload["response"]["data"][0]["type"] = "NG"
+    mock_resp.read.return_value = json.dumps(payload).encode("utf-8")
+    mock_resp.__enter__.return_value = mock_resp
+
+    with patch.dict("os.environ", {"EIA_API_KEY": "test_key_abc"}):
+        with patch("urllib.request.urlopen", return_value=mock_resp):
+            res = check_eia_api_coverage(workspace_dir=tmp_path)
+            assert res.status == "ERROR"
+            assert any("invalid respondent" in err for err in res.validation_errors)
+            assert any("invalid type" in err for err in res.validation_errors)
+
+
+def test_check_eia_api_coverage_http_error_mocked(tmp_path: Path) -> None:
     with patch.dict("os.environ", {"EIA_API_KEY": "invalid_key"}):
         err = urllib.error.HTTPError("https://api.eia.gov", 403, "Forbidden", {}, None)
         with patch("urllib.request.urlopen", side_effect=err):
-            res = check_eia_api_coverage()
+            res = check_eia_api_coverage(workspace_dir=tmp_path)
             assert res.api_key_configured is True
             assert res.status == "BLOCKED"
             assert "HTTP 403" in res.message
