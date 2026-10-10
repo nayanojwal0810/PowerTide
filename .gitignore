@@ -1,0 +1,51 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# C/Rust extensions
+*.so
+
+# Distribution / packaging
+dist/
+build/
+*.egg-info/
+.eggs/
+
+# Virtual environments
+.venv/
+venv/
+ENV/
+env/
+
+# Environment and secrets (allow .env.example)
+.env
+.env.*
+!.env.example
+
+# Internal instructions and raw/local data
+rules/
+data/
+
+# Model, MLflow, and forecast artifacts
+mlruns/
+models/
+artifacts/
+*.duckdb
+*.parquet
+latest.json
+pipeline_status.json
+
+# Testing and linting caches
+.pytest_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# IDE / OS metadata
+.idea/
+.vscode/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
