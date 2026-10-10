@@ -12,6 +12,7 @@ Verifies:
 
 from __future__ import annotations
 
+import json
 from datetime import UTC, datetime, timedelta, timezone
 
 import pytest
@@ -44,7 +45,7 @@ def make_valid_predictions(
     predictions: list[ForecastIntervalPrediction] = []
     for lead in range(MIN_LEAD_HOURS, MAX_LEAD_HOURS + 1):
         target = issue_time + timedelta(hours=lead)
-        # Vary demand so peak is uniquely at lead 24 (+15h into target day)
+        # Vary demand so peak is uniquely at lead 30 (+30h from issue time, 13:00 UTC on day D+1)
         demand = base_demand + (10_000.0 if lead == 30 else lead * 100.0)
         predictions.append(
             ForecastIntervalPrediction(
@@ -346,3 +347,62 @@ class TestForecastPayloadValidation:
                 weather_run_utc=wrong_hour_run,
                 predictions=payload.predictions,
             )
+
+    def test_predictions_collection_is_immutable(self) -> None:
+        issue = datetime(2026, 7, 15, 7, 0, 0, tzinfo=UTC)
+        payload = make_valid_payload(issue)
+
+        assert isinstance(payload.predictions, tuple)
+
+        with pytest.raises(TypeError):
+            payload.predictions[0] = payload.predictions[1]  # type: ignore[index]
+
+        with pytest.raises(AttributeError):
+            payload.predictions.append(payload.predictions[0])  # type: ignore[attr-defined]
+
+        with pytest.raises(AttributeError):
+            payload.predictions.pop()  # type: ignore[attr-defined]
+
+        with pytest.raises(AttributeError):
+            payload.predictions.clear()  # type: ignore[attr-defined]
+
+    def test_accepts_list_and_tuple_inputs(self) -> None:
+        issue = datetime(2026, 7, 15, 7, 0, 0, tzinfo=UTC)
+        cutoff = compute_demand_cutoff(issue)
+        weather_run = datetime(2026, 7, 15, 0, 0, 0, tzinfo=UTC)
+        pred_list = make_valid_predictions(issue)
+        pred_tuple = tuple(pred_list)
+
+        payload_from_list = ForecastPayload(
+            issue_time=issue,
+            demand_cutoff=cutoff,
+            weather_run_utc=weather_run,
+            predictions=pred_list,
+        )
+        payload_from_tuple = ForecastPayload(
+            issue_time=issue,
+            demand_cutoff=cutoff,
+            weather_run_utc=weather_run,
+            predictions=pred_tuple,
+        )
+
+        assert isinstance(payload_from_list.predictions, tuple)
+        assert isinstance(payload_from_tuple.predictions, tuple)
+        assert len(payload_from_list.predictions) == 24
+        assert payload_from_list.predictions == payload_from_tuple.predictions
+
+    def test_json_serialization_and_round_trip(self) -> None:
+        issue = datetime(2026, 7, 15, 7, 0, 0, tzinfo=UTC)
+        payload = make_valid_payload(issue)
+
+        json_str = payload.model_dump_json()
+        raw_dict = json.loads(json_str)
+
+        # JSON wire format must represent predictions as a JSON array
+        assert isinstance(raw_dict["predictions"], list)
+        assert len(raw_dict["predictions"]) == 24
+
+        reconstructed = ForecastPayload.model_validate_json(json_str)
+        assert isinstance(reconstructed.predictions, tuple)
+        assert len(reconstructed.predictions) == 24
+        assert reconstructed == payload

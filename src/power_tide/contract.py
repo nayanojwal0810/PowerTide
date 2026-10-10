@@ -181,9 +181,9 @@ class ForecastPayload(BaseModel):
     weather_run_utc: datetime = Field(
         ..., description="ECMWF IFS HRES run initialization timestamp (00:00 UTC day D)"
     )
-    predictions: list[ForecastIntervalPrediction] = Field(
+    predictions: tuple[ForecastIntervalPrediction, ...] = Field(
         ...,
-        description="Exactly 24 hourly predictions spanning day D+1",
+        description="Exactly 24 hourly predictions spanning day D+1 as an immutable sequence",
     )
     summary: ForecastSummary | None = Field(
         default=None,
