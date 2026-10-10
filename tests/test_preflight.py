@@ -12,6 +12,9 @@ from power_tide.preflight import (
     EXPECTED_HOLDOUT_HOURS,
     HOLDOUT_TARGET_END,
     HOLDOUT_TARGET_START,
+    LOCAL_DEMAND_EXPECTED_END,
+    LOCAL_DEMAND_EXPECTED_HOURS,
+    LOCAL_DEMAND_EXPECTED_START,
     TEXAS_PROXY_LOCATIONS,
     WEATHER_MODEL_ID,
     WEATHER_VARIABLES,
@@ -98,6 +101,9 @@ def test_proxy_locations_and_variables_definitions() -> None:
     assert EXPECTED_HOLDOUT_HOURS == 2_208
     assert HOLDOUT_TARGET_START == "2026-07-01T01"
     assert HOLDOUT_TARGET_END == "2026-10-01T00"
+    assert LOCAL_DEMAND_EXPECTED_START == "2024-01-01T00"
+    assert LOCAL_DEMAND_EXPECTED_END == "2025-12-31T23"
+    assert LOCAL_DEMAND_EXPECTED_HOURS == 17_544
 
 
 def test_compute_expected_weather_target_timestamps() -> None:
@@ -500,3 +506,137 @@ def test_check_eia_api_coverage_http_error_mocked(tmp_path: Path) -> None:
             assert res.api_key_configured is True
             assert res.status == "BLOCKED"
             assert "HTTP 403" in res.message
+
+
+def test_audit_local_eia_truncated_start_coverage(tmp_path: Path) -> None:
+    f = tmp_path / "truncated_start.json"
+    data = {
+        "response": {
+            "data": [
+                {"period": "2024-01-02T00", "respondent": "ERCO", "type": "D", "value": 35000},
+                {"period": "2024-01-02T01", "respondent": "ERCO", "type": "D", "value": 34000},
+            ]
+        }
+    }
+    f.write_text(json.dumps(data), encoding="utf-8")
+    summary = audit_local_eia_json_files(
+        [f],
+        expected_start_period=LOCAL_DEMAND_EXPECTED_START,
+        expected_end_period=LOCAL_DEMAND_EXPECTED_END,
+    )
+    assert summary.status == "FAIL"
+    assert any("missing start periods" in err for err in summary.errors)
+
+
+def test_audit_local_eia_truncated_end_coverage(tmp_path: Path) -> None:
+    f = tmp_path / "truncated_end.json"
+    data = {
+        "response": {
+            "data": [
+                {"period": "2024-01-01T00", "respondent": "ERCO", "type": "D", "value": 35000},
+                {"period": "2024-01-02T00", "respondent": "ERCO", "type": "D", "value": 34000},
+            ]
+        }
+    }
+    f.write_text(json.dumps(data), encoding="utf-8")
+    summary = audit_local_eia_json_files(
+        [f],
+        expected_start_period=LOCAL_DEMAND_EXPECTED_START,
+        expected_end_period=LOCAL_DEMAND_EXPECTED_END,
+    )
+    assert summary.status == "FAIL"
+    assert any("missing end periods" in err for err in summary.errors)
+
+
+def test_audit_local_eia_malformed_json_file(tmp_path: Path) -> None:
+    f = tmp_path / "broken.json"
+    f.write_bytes(b"{not-valid-json-syntax")
+    summary = audit_local_eia_json_files([f])
+    assert summary.status == "FAIL"
+    assert any("malformed JSON" in err for err in summary.errors)
+
+
+def test_audit_local_eia_malformed_schema_structures(tmp_path: Path) -> None:
+    # 1. Top-level is a list
+    f1 = tmp_path / "list_top.json"
+    f1.write_text(json.dumps([{"period": "2024-01-01T00"}]), encoding="utf-8")
+    s1 = audit_local_eia_json_files([f1])
+    assert s1.status == "FAIL"
+    assert any("top-level JSON is not an object" in err for err in s1.errors)
+
+    # 2. Missing response object
+    f2 = tmp_path / "missing_resp.json"
+    f2.write_text(json.dumps({"wrong_key": {}}), encoding="utf-8")
+    s2 = audit_local_eia_json_files([f2])
+    assert s2.status == "FAIL"
+    assert any("missing valid 'response' object" in err for err in s2.errors)
+
+    # 3. Data is not a list
+    f3 = tmp_path / "data_not_list.json"
+    f3.write_text(json.dumps({"response": {"data": "not_a_list"}}), encoding="utf-8")
+    s3 = audit_local_eia_json_files([f3])
+    assert s3.status == "FAIL"
+    assert any("'data' field is not a list" in err for err in s3.errors)
+
+    # 4. Record is not a dictionary
+    f4 = tmp_path / "bad_record.json"
+    f4.write_text(json.dumps({"response": {"data": ["scalar_record"]}}), encoding="utf-8")
+    s4 = audit_local_eia_json_files([f4])
+    assert s4.status == "FAIL"
+    assert any("is not an object" in err for err in s4.errors)
+
+
+def test_check_eia_api_coverage_malformed_top_level(tmp_path: Path) -> None:
+    mock_resp = MagicMock()
+    mock_resp.read.return_value = json.dumps(["unexpected", "list"]).encode("utf-8")
+    mock_resp.__enter__.return_value = mock_resp
+
+    with patch.dict("os.environ", {"EIA_API_KEY": "test_key_abc"}):
+        with patch("urllib.request.urlopen", return_value=mock_resp):
+            res = check_eia_api_coverage(workspace_dir=tmp_path)
+            assert res.status == "ERROR"
+            assert any(
+                "top-level response is not a JSON object" in err for err in res.validation_errors
+            )
+
+
+def test_check_eia_api_coverage_malformed_nested_response(tmp_path: Path) -> None:
+    mock_resp = MagicMock()
+    mock_resp.read.return_value = json.dumps({"response": "not-a-dict"}).encode("utf-8")
+    mock_resp.__enter__.return_value = mock_resp
+
+    with patch.dict("os.environ", {"EIA_API_KEY": "test_key_abc"}):
+        with patch("urllib.request.urlopen", return_value=mock_resp):
+            res = check_eia_api_coverage(workspace_dir=tmp_path)
+            assert res.status == "ERROR"
+            assert any(
+                "'response' field is not a JSON object" in err for err in res.validation_errors
+            )
+
+
+def test_query_ecmwf_ifs_run_audit_non_finite_coordinates() -> None:
+    d = date(2026, 7, 1)
+
+    # NaN latitude
+    payload_nan = _make_valid_locations_payload(d)
+    payload_nan[0]["latitude"] = float("nan")
+    mock_resp_nan = MagicMock()
+    mock_resp_nan.read.return_value = json.dumps(payload_nan).encode("utf-8")
+    mock_resp_nan.__enter__.return_value = mock_resp_nan
+
+    with patch("urllib.request.urlopen", return_value=mock_resp_nan):
+        res_nan = query_ecmwf_ifs_run_audit(d)
+    assert res_nan.available is False
+    assert any("non-finite or missing" in r for r in res_nan.failure_reasons)
+
+    # Inf longitude
+    payload_inf = _make_valid_locations_payload(d)
+    payload_inf[0]["longitude"] = float("inf")
+    mock_resp_inf = MagicMock()
+    mock_resp_inf.read.return_value = json.dumps(payload_inf).encode("utf-8")
+    mock_resp_inf.__enter__.return_value = mock_resp_inf
+
+    with patch("urllib.request.urlopen", return_value=mock_resp_inf):
+        res_inf = query_ecmwf_ifs_run_audit(d)
+    assert res_inf.available is False
+    assert any("non-finite or missing" in r for r in res_inf.failure_reasons)

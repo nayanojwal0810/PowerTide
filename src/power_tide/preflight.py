@@ -27,6 +27,11 @@ HOLDOUT_TARGET_START: Final[str] = "2026-07-01T01"
 HOLDOUT_TARGET_END: Final[str] = "2026-10-01T00"
 EXPECTED_HOLDOUT_HOURS: Final[int] = 2_208
 
+# Expected local raw demand archive constants (2024 through 2025)
+LOCAL_DEMAND_EXPECTED_START: Final[str] = "2024-01-01T00"
+LOCAL_DEMAND_EXPECTED_END: Final[str] = "2025-12-31T23"
+LOCAL_DEMAND_EXPECTED_HOURS: Final[int] = 17_544
+
 # Approved weather model identity on Open-Meteo Single Runs API
 WEATHER_MODEL_ID: Final[str] = "ecmwf_ifs"
 
@@ -201,6 +206,8 @@ def audit_local_eia_json_files(
     json_paths: list[Path],
     expected_type: str = "D",
     expected_respondent: str = "ERCO",
+    expected_start_period: str | None = None,
+    expected_end_period: str | None = None,
 ) -> EiaDatasetSummary:
     """Inspect and validate local raw EIA JSON files without mutating them."""
     if not json_paths:
@@ -217,12 +224,47 @@ def audit_local_eia_json_files(
     errors: list[str] = []
 
     for path in sorted_paths:
-        with open(path, encoding="utf-8") as f:
-            data = json.load(f)
-        batch = data.get("response", {}).get("data", [])
-        records.extend(batch)
+        try:
+            with open(path, encoding="utf-8") as f:
+                data = json.load(f)
+        except json.JSONDecodeError as e:
+            errors.append(f"File {path.name} contains malformed JSON: {e}")
+            continue
+        except (UnicodeDecodeError, OSError) as e:
+            errors.append(f"File {path.name} could not be read: {e}")
+            continue
+
+        if not isinstance(data, dict):
+            errors.append(
+                f"File {path.name} top-level JSON is not an object (got {type(data).__name__})"
+            )
+            continue
+
+        resp_obj = data.get("response")
+        if not isinstance(resp_obj, dict):
+            errors.append(
+                f"File {path.name} missing valid 'response' object (got {type(resp_obj).__name__})"
+            )
+            continue
+
+        batch = resp_obj.get("data")
+        if not isinstance(batch, list):
+            errors.append(
+                f"File {path.name} 'data' field is not a list (got {type(batch).__name__})"
+            )
+            continue
+
+        for rec_idx, r in enumerate(batch):
+            if not isinstance(r, dict):
+                errors.append(
+                    f"File {path.name} record {rec_idx} is not an object (got {type(r).__name__})"
+                )
+            else:
+                records.append(r)
 
     if not records:
+        if not errors:
+            errors.append("No records found in provided files")
         return EiaDatasetSummary(
             dataset_type="UNKNOWN",
             respondent="UNKNOWN",
@@ -241,7 +283,7 @@ def audit_local_eia_json_files(
             holdout_hours_present=0,
             holdout_coverage_ratio=0.0,
             status="FAIL",
-            errors=["No records found in provided files"],
+            errors=errors,
         )
 
     # 1. Period presence and format validation on every record
@@ -316,21 +358,45 @@ def audit_local_eia_json_files(
         if not is_chronological:
             errors.append("Records are not in strictly ascending chronological order")
 
-    # 6. Missing periods check across the span
+    # 6. Missing periods and span coverage check
     min_p = min(periods) if periods else ""
     max_p = max(periods) if periods else ""
     missing_period_samples: list[str] = []
     missing_periods_count = 0
 
-    if min_p and max_p and len(periods) == len(records):
+    target_start = expected_start_period if expected_start_period else min_p
+    target_end = expected_end_period if expected_end_period else max_p
+
+    if expected_start_period and min_p and min_p > expected_start_period:
+        errors.append(
+            f"Archive is missing start periods: expected {expected_start_period}, "
+            f"observed earliest {min_p}"
+        )
+    if expected_end_period and max_p and max_p < expected_end_period:
+        errors.append(
+            f"Archive is missing end periods: expected {expected_end_period}, "
+            f"observed latest {max_p}"
+        )
+
+    if target_start and target_end and periods:
         try:
-            expected_periods = set(compute_expected_eia_hourly_sequence(min_p, max_p))
+            expected_periods = set(compute_expected_eia_hourly_sequence(target_start, target_end))
             actual_periods_set = set(periods)
             missing_set = expected_periods - actual_periods_set
             missing_periods_count = len(missing_set)
             missing_period_samples = sorted(missing_set)[:5]
             if missing_periods_count > 0:
-                errors.append(f"Detected {missing_periods_count} missing hourly intervals in span")
+                errors.append(
+                    f"Detected {missing_periods_count} missing hourly intervals "
+                    f"in span {target_start} through {target_end}"
+                )
+            if expected_start_period and expected_end_period:
+                expected_total = len(expected_periods)
+                if len(actual_periods_set) != expected_total:
+                    errors.append(
+                        f"Expected {expected_total} unique hourly records for {target_start} "
+                        f"through {target_end}, but found {len(actual_periods_set)}"
+                    )
         except Exception as e:
             errors.append(f"Failed to generate expected period span: {e}")
 
@@ -460,8 +526,16 @@ def query_ecmwf_ifs_run_audit(
 
         ret_lat = loc.get("latitude")
         ret_lon = loc.get("longitude")
-        if not isinstance(ret_lat, (int, float)) or not isinstance(ret_lon, (int, float)):
-            failure_reasons.append(f"Missing valid latitude/longitude for {loc_name}")
+        if (
+            not isinstance(ret_lat, (int, float))
+            or not isinstance(ret_lon, (int, float))
+            or not math.isfinite(ret_lat)
+            or not math.isfinite(ret_lon)
+        ):
+            failure_reasons.append(
+                f"Coordinates for {loc_name} are non-finite or missing "
+                f"(lat: {ret_lat}, lon: {ret_lon})"
+            )
             target_intervals_valid = False
         elif proxy:
             # Check model-grid coordinate snapping tolerance
@@ -638,7 +712,7 @@ def check_eia_api_coverage(
 
     try:
         data = json.loads(raw_bytes.decode())
-    except Exception as e:
+    except (json.JSONDecodeError, UnicodeDecodeError) as e:
         safe_msg = f"EIA API response could not be parsed as JSON: {e}"
         return EiaApiAuditResult(
             api_key_configured=True,
@@ -657,11 +731,48 @@ def check_eia_api_coverage(
             validation_errors=[safe_msg],
         )
 
-    validation_errors: list[str] = []
-    response_block = data.get("response", {})
-    if not isinstance(response_block, dict):
-        validation_errors.append("Response missing valid 'response' object")
+    if not isinstance(data, dict):
+        safe_msg = f"EIA API top-level response is not a JSON object (got {type(data).__name__})"
+        return EiaApiAuditResult(
+            api_key_configured=True,
+            status="ERROR",
+            total_reported=0,
+            rows_returned=0,
+            start_period=start_period,
+            end_period=end_period,
+            timestamps_valid=False,
+            data_integrity_valid=False,
+            null_values_count=0,
+            invalid_values_count=0,
+            duplicate_timestamps_count=0,
+            missing_timestamps_count=expected_count,
+            message=safe_msg,
+            validation_errors=[safe_msg],
+        )
 
+    response_block = data.get("response")
+    if not isinstance(response_block, dict):
+        safe_msg = (
+            f"EIA API 'response' field is not a JSON object (got {type(response_block).__name__})"
+        )
+        return EiaApiAuditResult(
+            api_key_configured=True,
+            status="ERROR",
+            total_reported=0,
+            rows_returned=0,
+            start_period=start_period,
+            end_period=end_period,
+            timestamps_valid=False,
+            data_integrity_valid=False,
+            null_values_count=0,
+            invalid_values_count=0,
+            duplicate_timestamps_count=0,
+            missing_timestamps_count=expected_count,
+            message=safe_msg,
+            validation_errors=[safe_msg],
+        )
+
+    validation_errors: list[str] = []
     raw_total = response_block.get("total", 0)
     try:
         total = int(raw_total)
@@ -669,7 +780,7 @@ def check_eia_api_coverage(
         total = 0
         validation_errors.append(f"Invalid 'total' field in response: {raw_total}")
 
-    rows = response_block.get("data", [])
+    rows = response_block.get("data")
     if not isinstance(rows, list):
         rows = []
         validation_errors.append("Response 'data' field is not a list")
@@ -811,10 +922,16 @@ def run_complete_preflight_audit(
 
     # 1. Local archive audit
     local_demand = audit_local_eia_json_files(
-        demand_files, expected_type="D", expected_respondent="ERCO"
+        demand_files,
+        expected_type="D",
+        expected_respondent="ERCO",
+        expected_start_period=LOCAL_DEMAND_EXPECTED_START,
+        expected_end_period=LOCAL_DEMAND_EXPECTED_END,
     )
     local_forecast = audit_local_eia_json_files(
-        forecast_files, expected_type="DF", expected_respondent="ERCO"
+        forecast_files,
+        expected_type="DF",
+        expected_respondent="ERCO",
     )
 
     # 2. Complete EIA API audit
