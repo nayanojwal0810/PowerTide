@@ -31,7 +31,6 @@ data/
 mlruns/
 models/
 artifacts/
-*.duckdb
 *.parquet
 latest.json
 pipeline_status.json

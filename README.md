@@ -11,7 +11,7 @@ PowerTide is designed to deliver automated, operational day-ahead electricity de
 ### Forecast Contract Specifications
 
 - **Issue Time:** 07:00 UTC on day $D$.
-- **Historical Demand Cutoff:** 04:00 UTC on day $D$ (accommodating operational publication lag).
+- **Historical Demand Cutoff:** 04:00 UTC on day $D$ (configured operational cutoff buffer; input data availability is verified separately).
 - **Forecast Horizon:** Calendar day $D+1$ across 24 hourly intervals under the EIA hour-ending convention (01:00 UTC day $D+1$ through 00:00 UTC day $D+2$).
 - **Lead Times:** +18 hours through +41 hours from the issue time.
 - **Weather Inputs:** ECMWF IFS HRES 00:00 UTC Single Run.
